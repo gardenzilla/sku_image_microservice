@@ -18,11 +18,21 @@ pub trait SkuImageExt {
   fn fix_cover(&mut self);
 }
 
-#[derive(Serialize, Deserialize, Clone)]
-struct SkuImage {
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct SkuImage {
   pub sku: u32,
   pub cover_image_id: Option<String>,
   pub image_ids: Vec<String>,
+}
+
+impl SkuImage {
+  pub fn new(sku: u32) -> Self {
+    SkuImage {
+      sku,
+      cover_image_id: None,
+      image_ids: Vec::new(),
+    }
+  }
 }
 
 impl SkuImageExt for SkuImage {
@@ -117,5 +127,13 @@ impl SkuImageExt for SkuImage {
         self.cover_image_id = Some(first_image_id.clone());
       }
     }
+  }
+}
+
+impl VecPackMember for SkuImage {
+  type Out = u32;
+
+  fn get_id(&self) -> &Self::Out {
+    &self.sku
   }
 }

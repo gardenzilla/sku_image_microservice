@@ -1,3 +1,7 @@
+use gzlib::proto::sku_image::SkuObj;
+
+use crate::image;
+
 pub enum ServiceError {
   InternalError(String),
   NotFound(String),
@@ -51,10 +55,32 @@ impl From<ServiceError> for ::tonic::Status {
   }
 }
 
+impl From<::packman::PackError> for ServiceError {
+  fn from(error: ::packman::PackError) -> Self {
+    match error {
+      ::packman::PackError::ObjectNotFound => ServiceError::not_found(&error.to_string()),
+      _ => ServiceError::internal_error(&error.to_string()),
+    }
+  }
+}
+
 pub type ServiceResult<T> = Result<T, ServiceError>;
 
 impl From<std::env::VarError> for ServiceError {
   fn from(error: std::env::VarError) -> Self {
     ServiceError::internal_error(&format!("ENV KEY NOT FOUND. {}", error))
+  }
+}
+
+impl From<image::SkuImage> for SkuObj {
+  fn from(f: image::SkuImage) -> Self {
+    Self {
+      sku: f.sku,
+      cover_image_id: match f.cover_image_id {
+        Some(ciid) => ciid.to_string(),
+        None => "".to_string(),
+      },
+      image_ids: f.image_ids.clone(),
+    }
   }
 }
