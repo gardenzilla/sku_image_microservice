@@ -43,11 +43,13 @@ impl SkuImageExt for SkuImage {
     _file_bytes: Vec<u8>,
   ) -> Result<String, String> {
     // Create new image ID
-    let file_id = Uuid::new_v4().to_simple().to_string();
+    let file_id = format!(
+      "{}.{}",
+      Uuid::new_v4().to_simple().to_string(),
+      file_extension
+    );
     // Add new image ID to image_ids
-    self
-      .image_ids
-      .push(format!("{}.{}", &file_id, file_extension));
+    self.image_ids.push(file_id.clone());
     // Fix Cover
     self.fix_cover();
     // Return Ok image_id
