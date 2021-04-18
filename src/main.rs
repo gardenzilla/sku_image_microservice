@@ -3,6 +3,7 @@ use gzlib::proto::{
   sku_image::{
     sku_image_server::*, CoverBulkRequest, CoverObj, NewImageId, NewRequest, SkuRequest,
   },
+  sku_image_processer::{sku_image_processer_client::SkuImageProcesserClient, AddRequest},
 };
 use packman::VecPack;
 use sku_image_microservice::{
@@ -11,53 +12,78 @@ use sku_image_microservice::{
 };
 use std::{env, path::Path};
 use std::{error::Error, path::PathBuf};
+use tokio::fs::remove_file;
 use tokio::{fs::read_dir, process::Command, sync::Mutex};
-use tokio::{fs::remove_file, prelude::*};
 use tokio::{
   fs::{create_dir_all, File},
   sync::oneshot,
 };
-use tonic::{transport::Server, Request, Response, Status};
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::{
+  transport::{Channel, Server},
+  Request, Response, Status,
+};
 
 use gzlib::proto;
 
 struct SkuImageService {
   skus: Mutex<VecPack<image::SkuImage>>,
+  client_img_processer: Mutex<SkuImageProcesserClient<Channel>>,
 }
 
 impl SkuImageService {
-  pub fn init(skus: VecPack<image::SkuImage>) -> Self {
+  pub fn init(
+    skus: VecPack<image::SkuImage>,
+    img_processer: SkuImageProcesserClient<Channel>,
+  ) -> Self {
     Self {
       skus: Mutex::new(skus),
+      client_img_processer: Mutex::new(img_processer),
     }
   }
 
   async fn add_new(&self, r: NewRequest) -> ServiceResult<String> {
     // If we have SKU already created
-    if let Ok(sku) = self.skus.lock().await.find_id_mut(&r.sku) {
-      let res = sku
+    let image_id = match self.skus.lock().await.find_id_mut(&r.sku) {
+      Ok(sku) => sku
         .as_mut()
         .unpack()
-        .add_image(r.file_name, r.file_extension, r.image_bytes)
-        .map_err(|e| ServiceError::bad_request(&e))?;
-      return Ok(res);
-    }
+        .add_image(r.file_name, r.file_extension, r.image_bytes.clone())
+        .map_err(|e| ServiceError::bad_request(&e))?,
+      Err(_) => {
+        // Otherwise create sku
+        let mut new_sku = image::SkuImage::new(r.sku);
+        // and add image
+        let image_id = new_sku
+          .add_image(r.file_name, r.file_extension, r.image_bytes.clone())
+          .map_err(|e| ServiceError::bad_request(&e))?;
+        // Finally add new_sku object to skus db
+        self
+          .skus
+          .lock()
+          .await
+          .insert(new_sku)
+          .map_err(|e| ServiceError::bad_request(&e.to_string()))?;
+        // Return image_id
+        image_id
+      }
+    };
 
-    // Otherwise create sku
-    let mut new_sku = image::SkuImage::new(r.sku);
-    // and add image
-    let res = new_sku
-      .add_image(r.file_name, r.file_extension, r.image_bytes)
-      .map_err(|e| ServiceError::bad_request(&e))?;
-    // Finally add new_sku object to skus db
-    self
-      .skus
+    // Try to send image to SKU IMAGE processer
+    let _ = self
+      .client_img_processer
       .lock()
       .await
-      .insert(new_sku)
-      .map_err(|e| ServiceError::bad_request(&e.to_string()))?;
+      .add_image(AddRequest {
+        sku: r.sku,
+        image_id: image_id.clone(),
+        image_bytes: r.image_bytes,
+      })
+      .await
+      .map_err(|e| ServiceError::bad_request(&e.to_string()))?
+      .into_inner();
 
-    Ok(res)
+    Ok(image_id)
   }
 
   async fn get_images(&self, r: SkuRequest) -> ServiceResult<SkuObj> {
@@ -126,7 +152,7 @@ impl SkuImage for SkuImageService {
     Ok(Response::new(res))
   }
 
-  type GetCoverBulkStream = tokio::sync::mpsc::Receiver<Result<CoverObj, Status>>;
+  type GetCoverBulkStream = ReceiverStream<Result<CoverObj, Status>>;
 
   async fn get_cover_bulk(
     &self,
@@ -146,7 +172,7 @@ impl SkuImage for SkuImageService {
     });
 
     // Send back the receiver
-    Ok(Response::new(rx))
+    Ok(Response::new(ReceiverStream::new(rx)))
   }
 }
 
@@ -156,6 +182,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
   let sku_images: VecPack<image::SkuImage> =
     VecPack::load_or_init(PathBuf::from("data/sku_images"))
       .expect("Error while loading sku_images db");
+
+  let image_processer_client =
+    SkuImageProcesserClient::connect(service_address("SERVICE_ADDR_SKU_IMG_PROCESSER"))
+      .await
+      .expect("Could not connect to image processer service");
 
   let addr = env::var("SERVICE_ADDR_SKU_IMAGE")
     .unwrap_or("[::1]:50082".into())
@@ -168,7 +199,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
   // Spawn the server into a runtime
   tokio::task::spawn(async move {
     Server::builder()
-      .add_service(SkuImageServer::new(SkuImageService::init(sku_images)))
+      .add_service(SkuImageServer::new(SkuImageService::init(
+        sku_images,
+        image_processer_client,
+      )))
       .serve_with_shutdown(addr, async {
         let _ = rx.await;
       })
